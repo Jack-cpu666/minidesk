@@ -123,7 +123,433 @@ eventlet.spawn(cleanup_loop)
 
 # (Your HTML and other routes remain the same)
 # ... The entire HELPER_HTML string goes here ...
-HELPER_HTML = """ ... PASTE YOUR EXISTING HTML HERE ... """
+HELPER_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remote Desktop Helper</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            min-width: 400px;
+        }
+        
+        .title {
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 2rem;
+            font-weight: 300;
+        }
+        
+        .login-form {
+            margin-bottom: 20px;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        .input-group input {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e1e1e1;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            width: 100%;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .status {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .status.connecting {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        
+        .screen-container {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            z-index: 1000;
+        }
+        
+        .screen-container.active {
+            display: block;
+        }
+        
+        .screen-header {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 40px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            z-index: 1001;
+        }
+        
+        .disconnect-btn {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .disconnect-btn:hover {
+            background: #c82333;
+        }
+        
+        .screen-view {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            cursor: none;
+            user-select: none;
+            padding-top: 40px;
+        }
+        
+        .fps-counter {
+            position: absolute;
+            top: 50px;
+            right: 20px;
+            color: #00ff00;
+            font-family: monospace;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 5px 10px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container" id="loginContainer">
+        <h1 class="title">Remote Desktop Helper</h1>
+        <div class="login-form">
+            <div class="input-group">
+                <input type="password" id="passwordInput" placeholder="Enter session password" />
+            </div>
+            <button class="btn" id="connectBtn" onclick="connect()">Connect</button>
+        </div>
+        <div class="status" id="status" style="display: none;"></div>
+    </div>
+    
+    <div class="screen-container" id="screenContainer">
+        <div class="screen-header">
+            <span id="sessionInfo">Remote Desktop Session</span>
+            <div>
+                <span class="fps-counter" id="fpsCounter">FPS: 0</span>
+                <button class="disconnect-btn" onclick="disconnect()">Disconnect</button>
+            </div>
+        </div>
+        <img id="screenView" class="screen-view" />
+    </div>
+
+    <script>
+        let ws = null;
+        let connected = false;
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
+        
+        // UI Elements
+        const loginContainer = document.getElementById('loginContainer');
+        const screenContainer = document.getElementById('screenContainer');
+        const passwordInput = document.getElementById('passwordInput');
+        const connectBtn = document.getElementById('connectBtn');
+        const status = document.getElementById('status');
+        const screenView = document.getElementById('screenView');
+        const sessionInfo = document.getElementById('sessionInfo');
+        const fpsCounter = document.getElementById('fpsCounter');
+        
+        // Keyboard tracking
+        const pressedKeys = new Set();
+        
+        function showStatus(message, type = 'info') {
+            status.textContent = message;
+            status.className = `status ${type}`;
+            status.style.display = 'block';
+        }
+        
+        function hideStatus() {
+            status.style.display = 'none';
+        }
+        
+        function updateFPS() {
+            const now = Date.now();
+            if (now - lastFpsUpdate >= 1000) {
+                fpsCounter.textContent = `FPS: ${frameCount}`;
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+        }
+        
+        function connect() {
+            const password = passwordInput.value.trim();
+            if (!password) {
+                showStatus('Please enter a password', 'error');
+                return;
+            }
+            
+            connectBtn.disabled = true;
+            showStatus('Connecting...', 'connecting');
+            
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws/connect`;
+                
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = function() {
+                    // Send handshake
+                    const handshake = {
+                        role: 'helper',
+                        password: password
+                    };
+                    ws.send(JSON.stringify(handshake));
+                };
+                
+                ws.onmessage = function(event) {
+                    try {
+                        if (event.data.startsWith('s:')) {
+                            // Screen data
+                            const base64Data = event.data.substring(2);
+                            screenView.src = `data:image/jpeg;base64,${base64Data}`;
+                            frameCount++;
+                            updateFPS();
+                            
+                            if (!connected) {
+                                connected = true;
+                                loginContainer.style.display = 'none';
+                                screenContainer.classList.add('active');
+                                sessionInfo.textContent = `Session: ${password.substring(0, 8)}...`;
+                                setupInputHandlers();
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Message handling error:', error);
+                    }
+                };
+                
+                ws.onclose = function(event) {
+                    connected = false;
+                    connectBtn.disabled = false;
+                    screenContainer.classList.remove('active');
+                    loginContainer.style.display = 'block';
+                    
+                    if (event.code === 1000) {
+                        showStatus('Disconnected', 'info');
+                    } else {
+                        showStatus('Connection lost. Please try again.', 'error');
+                    }
+                };
+                
+                ws.onerror = function(error) {
+                    console.error('WebSocket error:', error);
+                    showStatus('Connection error. Please try again.', 'error');
+                    connectBtn.disabled = false;
+                };
+                
+            } catch (error) {
+                console.error('Connection error:', error);
+                showStatus('Failed to connect. Please try again.', 'error');
+                connectBtn.disabled = false;
+            }
+        }
+        
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+        
+        function setupInputHandlers() {
+            // Mouse events
+            screenView.addEventListener('mousemove', function(e) {
+                if (!connected || !ws) return;
+                
+                const rect = screenView.getBoundingClientRect();
+                const x = (e.clientX - rect.left) / rect.width;
+                const y = (e.clientY - rect.top) / rect.height;
+                
+                const msg = {
+                    type: 'mousemove',
+                    x: Math.max(0, Math.min(1, x)),
+                    y: Math.max(0, Math.min(1, y))
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            screenView.addEventListener('mousedown', function(e) {
+                if (!connected || !ws) return;
+                e.preventDefault();
+                
+                const button = e.button === 0 ? 'left' : 'right';
+                const msg = {
+                    type: 'mousedown',
+                    button: button
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            screenView.addEventListener('mouseup', function(e) {
+                if (!connected || !ws) return;
+                e.preventDefault();
+                
+                const button = e.button === 0 ? 'left' : 'right';
+                const msg = {
+                    type: 'mouseup',
+                    button: button
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            screenView.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+            });
+            
+            screenView.addEventListener('wheel', function(e) {
+                if (!connected || !ws) return;
+                e.preventDefault();
+                
+                const msg = {
+                    type: 'scroll',
+                    delta: -e.deltaY / 100
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            // Keyboard events
+            document.addEventListener('keydown', function(e) {
+                if (!connected || !ws) return;
+                
+                const key = e.key;
+                if (pressedKeys.has(key)) return; // Prevent key repeat
+                
+                pressedKeys.add(key);
+                
+                const msg = {
+                    type: 'keydown',
+                    key: key.length === 1 ? key : e.code.replace('Key', '').toLowerCase()
+                };
+                
+                ws.send(JSON.stringify(msg));
+                e.preventDefault();
+            });
+            
+            document.addEventListener('keyup', function(e) {
+                if (!connected || !ws) return;
+                
+                const key = e.key;
+                pressedKeys.delete(key);
+                
+                const msg = {
+                    type: 'keyup',
+                    key: key.length === 1 ? key : e.code.replace('Key', '').toLowerCase()
+                };
+                
+                ws.send(JSON.stringify(msg));
+                e.preventDefault();
+            });
+            
+            // Focus management
+            window.addEventListener('blur', function() {
+                pressedKeys.clear();
+            });
+        }
+        
+        // Enter key to connect
+        passwordInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                connect();
+            }
+        });
+        
+        // Auto-focus password input
+        passwordInput.focus();
+    </script>
+</body>
+</html>
+"""
 
 
 @app.route('/')
