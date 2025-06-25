@@ -1,5 +1,6 @@
 Flask
 flask-sock
 gunicorn
-gevent-websocket
+gevent
 websockets
+redis
