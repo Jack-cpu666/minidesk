@@ -1,35 +1,21 @@
 import os
 import json
 import logging
-import gevent
-import redis
 from flask import Flask, Response
 from flask_sock import Sock
 
 # --- Basic Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Flask App & Redis Initialization ---
+# --- Flask App Initialization ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'a-very-secret-key-for-dev')
 sock = Sock(app)
 
-# Connect to Redis using the URL provided by Render's environment variables
-# This will automatically handle authentication.
-try:
-    redis_url = os.environ.get('REDIS_URL')
-    if not redis_url:
-        raise ValueError("REDIS_URL environment variable not set. Please add a Redis instance on Render.")
-    redis_client = redis.from_url(redis_url, decode_responses=True)
-    redis_client.ping() # Check the connection
-    logging.info("Successfully connected to Redis.")
-except Exception as e:
-    logging.error(f"FATAL: Could not connect to Redis: {e}")
-    # In a real-world scenario, you might prevent the app from starting.
-    redis_client = None
+# --- Session Management ---
+sessions = {}
 
-# --- Helper Interface (No Changes Needed Here) ---
-# [The HELPER_INTERFACE_HTML string remains exactly the same as before]
+# --- Helper Interface (Controller UI) with Auto-Reconnect ---
 HELPER_INTERFACE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -45,7 +31,8 @@ HELPER_INTERFACE_HTML = """
         #auth-container button:hover { background-color: #0056b3; }
         #main-container { display: none; width: 100%; height: 100%; }
         #screen-view { width: 100%; height: 100%; object-fit: contain; cursor: crosshair; }
-        #status-bar { position: fixed; top: 0; left: 0; background-color: rgba(0,0,0,0.7); padding: 5px 10px; font-size: 14px; border-bottom-right-radius: 5px; }
+        #status-bar { position: fixed; top: 0; left: 0; background-color: rgba(0,0,0,0.7); padding: 5px 10px; font-size: 14px; border-bottom-right-radius: 5px; z-index: 100; transition: background-color 0.3s; }
+        #status-bar.reconnecting { background-color: #e67e22; }
     </style>
 </head>
 <body>
@@ -58,6 +45,7 @@ HELPER_INTERFACE_HTML = """
         <div id="status-bar">Status: Disconnected</div>
         <img id="screen-view" alt="Remote screen stream">
     </div>
+
     <script>
         const passwordInput = document.getElementById('password-input');
         const connectBtn = document.getElementById('connect-btn');
@@ -65,166 +53,167 @@ HELPER_INTERFACE_HTML = """
         const mainContainer = document.getElementById('main-container');
         const screenView = document.getElementById('screen-view');
         const statusBar = document.getElementById('status-bar');
+
         let ws;
+        let sessionPassword = '';
+        let reconnectInterval;
+
         const MOUSE_BUTTON_MAP = { 0: 'left', 1: 'middle', 2: 'right' };
-        const KEY_MAP = {"Control": "ctrl", "Shift": "shift", "Alt": "alt","Meta": "cmd", "ArrowUp": "up", "ArrowDown": "down","ArrowLeft": "left", "ArrowRight": "right", "Enter": "enter","Escape": "esc", "Backspace": "backspace", "Tab": "tab","Delete": "delete", "Insert": "insert", "Home": "home", "End": "end","PageUp": "page_up", "PageDown": "page_down","F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4","F5": "f5", "F6": "f6", "F7": "f7", "F8": "f8","F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",};
-        function connect() {
-            const password = passwordInput.value;
-            if (!password) {alert("Please enter a password."); return;}
+        const KEY_MAP = {"Control":"ctrl","Shift":"shift","Alt":"alt","Meta":"cmd","ArrowUp":"up","ArrowDown":"down","ArrowLeft":"left","ArrowRight":"right","Enter":"enter","Escape":"esc","Backspace":"backspace","Tab":"tab","Delete":"delete","Insert":"insert","Home":"home","End":"end","PageUp":"page_up","PageDown":"page_down","F1":"f1","F2":"f2","F3":"f3","F4":"f4","F5":"f5","F6":"f6","F7":"f7","F8":"f8","F9":"f9","F10":"f10","F11":"f11","F12":"f12"};
+
+        function startConnection() {
+            if (reconnectInterval) clearInterval(reconnectInterval);
+
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${wsProtocol}//${window.location.host}/ws/connect`;
+            
             ws = new WebSocket(wsUrl);
+            
+            statusBar.textContent = 'Status: Connecting...';
+            statusBar.classList.remove('reconnecting');
+
             ws.onopen = () => {
                 console.log("WebSocket connection opened.");
                 statusBar.textContent = 'Status: Authenticating...';
-                ws.send(JSON.stringify({role: 'helper', password: password}));
+                ws.send(JSON.stringify({ role: 'helper', password: sessionPassword }));
             };
+
             ws.onmessage = (event) => {
                 if (event.data.startsWith('s:')) {
-                    if (authContainer.style.display !== 'none') {
+                    if (mainContainer.style.display !== 'block') {
                         authContainer.style.display = 'none';
                         mainContainer.style.display = 'block';
-                        statusBar.textContent = 'Status: Connected';
                     }
+                    statusBar.textContent = 'Status: Connected';
+                    statusBar.classList.remove('reconnecting');
+                    if (reconnectInterval) clearInterval(reconnectInterval);
                     screenView.src = 'data:image/jpeg;base64,' + event.data.substring(2);
-                } else {console.log("Received non-screen data:", event.data);}
+                }
             };
+
             ws.onclose = () => {
-                console.log("WebSocket connection closed.");
-                statusBar.textContent = 'Status: Disconnected';
-                alert("Connection lost. Please reconnect.");
-                mainContainer.style.display = 'none';
-                authContainer.style.display = 'flex';
+                console.log("WebSocket connection closed. Attempting to reconnect...");
                 ws = null;
+                mainContainer.style.display = 'block'; 
+                statusBar.textContent = 'Status: Reconnecting...';
+                statusBar.classList.add('reconnecting');
+
+                if (!reconnectInterval) {
+                    reconnectInterval = setInterval(startConnection, 5000);
+                }
             };
+
             ws.onerror = (error) => {
                 console.error("WebSocket error:", error);
-                statusBar.textContent = 'Status: Error';
-                alert("Connection error occurred.");
+                ws.close();
             };
         }
-        connectBtn.addEventListener('click', connect);
-        passwordInput.addEventListener('keyup', (event) => { if (event.key === 'Enter') {connect();} });
-        function sendControlMessage(data) { if (ws && ws.readyState === WebSocket.OPEN) {ws.send(JSON.stringify(data));} }
-        screenView.addEventListener('mousemove', (e) => {
-            const rect = screenView.getBoundingClientRect(); const x = e.clientX - rect.left; const y = e.clientY - rect.top;
-            sendControlMessage({ type: 'mouse_move', x: x / rect.width, y: y / rect.height });
-        });
-        screenView.addEventListener('mousedown', (e) => {
-            e.preventDefault(); const rect = screenView.getBoundingClientRect(); const x = e.clientX - rect.left; const y = e.clientY - rect.top;
-            sendControlMessage({ type: 'mouse_down', x: x / rect.width, y: y / rect.height, button: MOUSE_BUTTON_MAP[e.button] });
-        });
-        screenView.addEventListener('mouseup', (e) => {
-            e.preventDefault(); const rect = screenView.getBoundingClientRect(); const x = e.clientX - rect.left; const y = e.clientY - rect.top;
-            sendControlMessage({ type: 'mouse_up', x: x / rect.width, y: y / rect.height, button: MOUSE_BUTTON_MAP[e.button] });
-        });
+        
+        function initiateSession() {
+            sessionPassword = passwordInput.value;
+            if (!sessionPassword) {
+                alert("Please enter a password.");
+                return;
+            }
+            startConnection();
+        }
+
+        connectBtn.addEventListener('click', initiateSession);
+        passwordInput.addEventListener('keyup', (e) => e.key === 'Enter' && initiateSession());
+        
+        function sendControlMessage(data) { if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(data)); } }
+        screenView.addEventListener('mousemove', (e) => { const r = screenView.getBoundingClientRect(); sendControlMessage({ type: 'mouse_move', x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }); });
+        screenView.addEventListener('mousedown', (e) => { e.preventDefault(); const r = screenView.getBoundingClientRect(); sendControlMessage({ type: 'mouse_down', button: MOUSE_BUTTON_MAP[e.button], x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }); });
+        screenView.addEventListener('mouseup', (e) => { e.preventDefault(); const r = screenView.getBoundingClientRect(); sendControlMessage({ type: 'mouse_up', button: MOUSE_BUTTON_MAP[e.button], x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }); });
         screenView.addEventListener('wheel', (e) => { e.preventDefault(); sendControlMessage({ type: 'mouse_scroll', dx: -e.deltaX, dy: -e.deltaY }); });
         screenView.addEventListener('contextmenu', (e) => e.preventDefault());
-        document.addEventListener('keydown', (e) => {
-            if (mainContainer.style.display === 'block') { e.preventDefault(); let key = KEY_MAP[e.key] || e.key; if(key.length === 1) key = key.toLowerCase(); sendControlMessage({ type: 'key_down', key: key }); }
-        });
-        document.addEventListener('keyup', (e) => {
-            if (mainContainer.style.display === 'block') { e.preventDefault(); let key = KEY_MAP[e.key] || e.key; if(key.length === 1) key = key.toLowerCase(); sendControlMessage({ type: 'key_up', key: key }); }
-        });
+        document.addEventListener('keydown', (e) => { if (mainContainer.style.display === 'block') { e.preventDefault(); let k = KEY_MAP[e.key] || e.key; sendControlMessage({ type: 'key_down', key: k.length === 1 ? k.toLowerCase() : k }); } });
+        document.addEventListener('keyup', (e) => { if (mainContainer.style.display === 'block') { e.preventDefault(); let k = KEY_MAP[e.key] || e.key; sendControlMessage({ type: 'key_up', key: k.length === 1 ? k.toLowerCase() : k }); } });
     </script>
 </body>
 </html>
 """
 
-# --- Scalable WebSocket Logic using Redis Pub/Sub ---
+# --- Flask Routes ---
 @app.route('/')
 def index():
     return Response(HELPER_INTERFACE_HTML, mimetype='text/html')
 
-class Broadcaster:
-    """Manages Redis Pub/Sub for a single WebSocket connection."""
-    def __init__(self, password, role):
-        if not redis_client:
-            raise ConnectionError("Redis is not available.")
-        
-        # Define Redis channel names based on session password
-        self.password = password
-        self.role = role
-        # Client sends to screen_channel, Helper sends to control_channel
-        self.screen_channel = f"session-{password}-screen"
-        self.control_channel = f"session-{password}-control"
-        
-        # Set up a Redis PubSub object
-        self.pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
-        # Subscribe to the channel this role needs to LISTEN to
-        if self.role == 'helper':
-            self.pubsub.subscribe(self.screen_channel)
-        else: # role == 'client'
-            self.pubsub.subscribe(self.control_channel)
-
-    def __iter__(self):
-        """Yields messages from the subscribed Redis channel."""
-        for message in self.pubsub.listen():
-            yield message['data']
-
-    def publish(self, data):
-        """Publishes a message to the appropriate Redis channel."""
-        channel = self.control_channel if self.role == 'helper' else self.screen_channel
-        redis_client.publish(channel, data)
-
-    def close(self):
-        """Unsubscribe and close the pubsub connection."""
-        self.pubsub.unsubscribe()
-        self.pubsub.close()
-        logging.info(f"Closed Redis PubSub for {self.role} in session '{self.password}'")
-
-
 @sock.route('/ws/connect')
 def connect_websocket(ws):
-    """Handles WebSocket connections for both clients and helpers."""
-    broadcaster = None
+    ws_role, ws_pass = None, None
     try:
-        # 1. Handshake
         handshake_data = ws.receive(timeout=10)
-        data = json.loads(handshake_data)
-        role = data.get('role')
-        password = data.get('password')
-        if not all([role, password]):
-            logging.error("Invalid handshake.")
+        if not handshake_data:
+            logging.warning("WebSocket handshake timeout.")
             return
 
-        logging.info(f"Handshake received: role={role}, pass=***, from={ws.environ.get('REMOTE_ADDR')}")
-        
-        # 2. Setup Redis Broadcaster
-        broadcaster = Broadcaster(password, role)
+        data = json.loads(handshake_data)
+        ws_role = data.get('role')
+        ws_pass = data.get('password')
 
-        # 3. Create two independent greenlets (lightweight threads)
-        #    - One to listen for incoming messages from the WebSocket and publish them to Redis
-        #    - One to listen for messages from Redis and send them to the WebSocket
+        if not all([ws_role, ws_pass]):
+            logging.error(f"Invalid handshake: {handshake_data}")
+            return
         
-        # Greenlet for receiving from WebSocket and publishing to Redis
-        receiver_greenlet = gevent.spawn(lambda: [broadcaster.publish(message) for message in ws])
-        
-        # Greenlet for receiving from Redis and sending to WebSocket
-        # The broadcaster itself is an iterator that listens to Redis
-        sender_greenlet = gevent.spawn(lambda: [ws.send(message) for message in broadcaster])
+        logging.info(f"Handshake received: role={ws_role}, pass=***, from={ws.environ.get('REMOTE_ADDR')}")
 
-        # gevent.joinall will wait for either greenlet to exit.
-        # This will happen if the websocket closes (receiver exits) or if a Redis error occurs.
-        gevent.joinall([receiver_greenlet, sender_greenlet], raise_error=True)
+        if ws_pass not in sessions:
+            sessions[ws_pass] = {'client_ws': None, 'helper_ws': None}
+
+        # --- SELF-HEALING LOGIC ---
+        if ws_role == 'client':
+            if sessions[ws_pass]['client_ws'] is not None:
+                logging.warning(f"Replacing stale client for session '{ws_pass}'.")
+                try:
+                    sessions[ws_pass]['client_ws'].close(reason=1001, message="New client connected")
+                except Exception as e:
+                    logging.warning(f"Could not close stale client socket: {e}")
+            sessions[ws_pass]['client_ws'] = ws
+        
+        elif ws_role == 'helper':
+            if sessions[ws_pass]['helper_ws'] is not None:
+                logging.warning(f"Replacing stale helper for session '{ws_pass}'.")
+                try:
+                    sessions[ws_pass]['helper_ws'].close(reason=1001, message="New helper connected")
+                except Exception as e:
+                    logging.warning(f"Could not close stale helper socket: {e}")
+            sessions[ws_pass]['helper_ws'] = ws
+        else:
+            logging.error(f"Unknown role '{ws_role}'")
+            return
+
+        while True:
+            message = ws.receive()
+            if message is None: break
+            session = sessions.get(ws_pass)
+            if not session: break
+            
+            if ws_role == 'client' and session.get('helper_ws'):
+                session['helper_ws'].send(message)
+            elif ws_role == 'helper' and session.get('client_ws'):
+                session['client_ws'].send(message)
 
     except Exception as e:
-        # A closed connection is normal, not an error we need to spam logs with.
-        if "Connection closed" not in str(e) and isinstance(e, (ConnectionError, gevent.GreenletExit)) == False:
-            logging.error(f"Error in websocket handler: {type(e).__name__}: {e}", exc_info=False)
-            
+        if "Connection closed" in str(e):
+            logging.info(f"WebSocket {ws_role} in session '{ws_pass}' disconnected: {e}")
+        else:
+            logging.error(f"Error in WebSocket handler for {ws_role} in session '{ws_pass}': {e}")
+    
     finally:
-        # No matter what happens, ensure the broadcaster is closed to clean up the Redis subscription.
-        if broadcaster:
-            broadcaster.close()
+        # ROBUST Cleanup
+        if ws_pass and ws_role and ws_pass in sessions:
+            if sessions[ws_pass].get(f'{ws_role}_ws') == ws:
+                sessions[ws_pass][f'{ws_role}_ws'] = None
+                logging.info(f"Cleaned up active {ws_role} for session '{ws_pass}'.")
+            if not sessions[ws_pass]['client_ws'] and not sessions[ws_pass]['helper_ws']:
+                logging.info(f"Session '{ws_pass}' is now empty and is being deleted.")
+                del sessions[ws_pass]
 
-# Main entry point (for local testing, Render uses gunicorn)
 if __name__ == '__main__':
-    if not redis_client:
-        print("Cannot start server: Redis connection failed. Check your REDIS_URL or Redis server status.")
-    else:
-        from gevent.pywsgi import WSGIServer
-        port = int(os.environ.get("PORT", 5000))
-        print(f"Starting server with gevent on http://127.0.0.1:{port}")
-        http_server = WSGIServer(('', port), app)
-        http_server.serve_forever()
+    # This block is for local testing. Render uses the Procfile command.
+    from gevent.pywsgi import WSGIServer
+    from geventwebsocket.handler import WebSocketHandler
+    print("Starting development server on http://127.0.0.1:5000")
+    server = WSGIServer(('', 5000), app, handler_class=WebSocketHandler)
+    server.serve_forever()
