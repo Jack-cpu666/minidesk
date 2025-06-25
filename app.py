@@ -1,219 +1,625 @@
-import os
+#!/usr/bin/env python3
+"""
+Remote Desktop Broker Server - Production Ready
+Flask server with WebSocket support for Render.com deployment
+"""
+
+from flask import Flask, request, jsonify
+from flask_sock import Sock
 import json
 import logging
-from flask import Flask, Response
-from flask_sock import Sock
+import threading
+import time
+from collections import defaultdict
+import os
 
-# --- Basic Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- Flask App Initialization ---
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'a-very-secret-key-for-dev')
 sock = Sock(app)
 
-# --- Session Management ---
+# Global session management
 sessions = {}
+session_lock = threading.Lock()
 
-# --- Helper Interface (Controller UI) with Auto-Reconnect ---
-HELPER_INTERFACE_HTML = """
+# Connection cleanup interval
+CLEANUP_INTERVAL = 60  # seconds
+INACTIVE_TIMEOUT = 300  # 5 minutes
+
+class SessionManager:
+    def __init__(self):
+        self.sessions = {}
+        self.lock = threading.Lock()
+        
+    def create_session(self, password):
+        """Create a new session"""
+        with self.lock:
+            if password not in self.sessions:
+                self.sessions[password] = {
+                    'client_ws': None,
+                    'helper_ws': None,
+                    'last_activity': time.time(),
+                    'active': True
+                }
+                logger.info(f"Created session: {password[:8]}...")
+    
+    def add_connection(self, password, role, websocket):
+        """Add a connection to a session"""
+        with self.lock:
+            if password not in self.sessions:
+                self.create_session(password)
+            
+            self.sessions[password][f'{role}_ws'] = websocket
+            self.sessions[password]['last_activity'] = time.time()
+            logger.info(f"Added {role} to session: {password[:8]}...")
+    
+    def remove_connection(self, password, role):
+        """Remove a connection from a session"""
+        with self.lock:
+            if password in self.sessions:
+                self.sessions[password][f'{role}_ws'] = None
+                self.sessions[password]['last_activity'] = time.time()
+                logger.info(f"Removed {role} from session: {password[:8]}...")
+                
+                # Clean up empty sessions
+                if (self.sessions[password]['client_ws'] is None and 
+                    self.sessions[password]['helper_ws'] is None):
+                    del self.sessions[password]
+                    logger.info(f"Cleaned up empty session: {password[:8]}...")
+    
+    def get_peer_ws(self, password, role):
+        """Get the peer WebSocket for message forwarding"""
+        with self.lock:
+            if password in self.sessions:
+                peer_role = 'helper' if role == 'client' else 'client'
+                return self.sessions[password].get(f'{peer_role}_ws')
+            return None
+    
+    def update_activity(self, password):
+        """Update last activity timestamp"""
+        with self.lock:
+            if password in self.sessions:
+                self.sessions[password]['last_activity'] = time.time()
+    
+    def cleanup_inactive_sessions(self):
+        """Remove inactive sessions"""
+        current_time = time.time()
+        to_remove = []
+        
+        with self.lock:
+            for password, session in self.sessions.items():
+                if current_time - session['last_activity'] > INACTIVE_TIMEOUT:
+                    to_remove.append(password)
+        
+        for password in to_remove:
+            with self.lock:
+                if password in self.sessions:
+                    del self.sessions[password]
+                    logger.info(f"Cleaned up inactive session: {password[:8]}...")
+
+# Initialize session manager
+session_manager = SessionManager()
+
+def cleanup_thread():
+    """Background thread for session cleanup"""
+    while True:
+        time.sleep(CLEANUP_INTERVAL)
+        try:
+            session_manager.cleanup_inactive_sessions()
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_thread, daemon=True)
+cleanup_thread.start()
+
+# Embedded HTML interface
+HELPER_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Remote Control Helper</title>
+    <title>Remote Desktop Helper</title>
     <style>
-        body, html { margin: 0; padding: 0; height: 100%; overflow: hidden; background-color: #1a1a1a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-        #auth-container { display: flex; align-items: center; justify-content: center; height: 100%; flex-direction: column; gap: 15px; }
-        #auth-container input { padding: 10px; width: 200px; background-color: #333; border: 1px solid #555; color: #fff; border-radius: 4px; }
-        #auth-container button { padding: 10px 20px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; font-weight: bold; }
-        #auth-container button:hover { background-color: #0056b3; }
-        #main-container { display: none; width: 100%; height: 100%; }
-        #screen-view { width: 100%; height: 100%; object-fit: contain; cursor: crosshair; }
-        #status-bar { position: fixed; top: 0; left: 0; background-color: rgba(0,0,0,0.7); padding: 5px 10px; font-size: 14px; border-bottom-right-radius: 5px; z-index: 100; transition: background-color 0.3s; }
-        #status-bar.reconnecting { background-color: #e67e22; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            min-width: 400px;
+        }
+        
+        .title {
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 2rem;
+            font-weight: 300;
+        }
+        
+        .login-form {
+            margin-bottom: 20px;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        .input-group input {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e1e1e1;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            width: 100%;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .status {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .status.connecting {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        
+        .screen-container {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            z-index: 1000;
+        }
+        
+        .screen-container.active {
+            display: block;
+        }
+        
+        .screen-header {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 40px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            z-index: 1001;
+        }
+        
+        .disconnect-btn {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .disconnect-btn:hover {
+            background: #c82333;
+        }
+        
+        .screen-view {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            cursor: none;
+            user-select: none;
+            padding-top: 40px;
+        }
+        
+        .fps-counter {
+            position: absolute;
+            top: 50px;
+            right: 20px;
+            color: #00ff00;
+            font-family: monospace;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 5px 10px;
+            border-radius: 3px;
+        }
     </style>
 </head>
 <body>
-    <div id="auth-container">
-        <h2>Enter Session Password</h2>
-        <input type="password" id="password-input" placeholder="Password">
-        <button id="connect-btn">Connect</button>
+    <div class="container" id="loginContainer">
+        <h1 class="title">Remote Desktop Helper</h1>
+        <div class="login-form">
+            <div class="input-group">
+                <input type="password" id="passwordInput" placeholder="Enter session password" />
+            </div>
+            <button class="btn" id="connectBtn" onclick="connect()">Connect</button>
+        </div>
+        <div class="status" id="status" style="display: none;"></div>
     </div>
-    <div id="main-container">
-        <div id="status-bar">Status: Disconnected</div>
-        <img id="screen-view" alt="Remote screen stream">
+    
+    <div class="screen-container" id="screenContainer">
+        <div class="screen-header">
+            <span id="sessionInfo">Remote Desktop Session</span>
+            <div>
+                <span class="fps-counter" id="fpsCounter">FPS: 0</span>
+                <button class="disconnect-btn" onclick="disconnect()">Disconnect</button>
+            </div>
+        </div>
+        <img id="screenView" class="screen-view" />
     </div>
 
     <script>
-        const passwordInput = document.getElementById('password-input');
-        const connectBtn = document.getElementById('connect-btn');
-        const authContainer = document.getElementById('auth-container');
-        const mainContainer = document.getElementById('main-container');
-        const screenView = document.getElementById('screen-view');
-        const statusBar = document.getElementById('status-bar');
-
-        let ws;
-        let sessionPassword = '';
-        let reconnectInterval;
-
-        const MOUSE_BUTTON_MAP = { 0: 'left', 1: 'middle', 2: 'right' };
-        const KEY_MAP = {"Control":"ctrl","Shift":"shift","Alt":"alt","Meta":"cmd","ArrowUp":"up","ArrowDown":"down","ArrowLeft":"left","ArrowRight":"right","Enter":"enter","Escape":"esc","Backspace":"backspace","Tab":"tab","Delete":"delete","Insert":"insert","Home":"home","End":"end","PageUp":"page_up","PageDown":"page_down","F1":"f1","F2":"f2","F3":"f3","F4":"f4","F5":"f5","F6":"f6","F7":"f7","F8":"f8","F9":"f9","F10":"f10","F11":"f11","F12":"f12"};
-
-        function startConnection() {
-            if (reconnectInterval) clearInterval(reconnectInterval);
-
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${wsProtocol}//${window.location.host}/ws/connect`;
-            
-            ws = new WebSocket(wsUrl);
-            
-            statusBar.textContent = 'Status: Connecting...';
-            statusBar.classList.remove('reconnecting');
-
-            ws.onopen = () => {
-                console.log("WebSocket connection opened.");
-                statusBar.textContent = 'Status: Authenticating...';
-                ws.send(JSON.stringify({ role: 'helper', password: sessionPassword }));
-            };
-
-            ws.onmessage = (event) => {
-                if (event.data.startsWith('s:')) {
-                    if (mainContainer.style.display !== 'block') {
-                        authContainer.style.display = 'none';
-                        mainContainer.style.display = 'block';
-                    }
-                    statusBar.textContent = 'Status: Connected';
-                    statusBar.classList.remove('reconnecting');
-                    if (reconnectInterval) clearInterval(reconnectInterval);
-                    screenView.src = 'data:image/jpeg;base64,' + event.data.substring(2);
-                }
-            };
-
-            ws.onclose = () => {
-                console.log("WebSocket connection closed. Attempting to reconnect...");
-                ws = null;
-                mainContainer.style.display = 'block'; 
-                statusBar.textContent = 'Status: Reconnecting...';
-                statusBar.classList.add('reconnecting');
-
-                if (!reconnectInterval) {
-                    reconnectInterval = setInterval(startConnection, 5000);
-                }
-            };
-
-            ws.onerror = (error) => {
-                console.error("WebSocket error:", error);
-                ws.close();
-            };
+        let ws = null;
+        let connected = false;
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
+        
+        // UI Elements
+        const loginContainer = document.getElementById('loginContainer');
+        const screenContainer = document.getElementById('screenContainer');
+        const passwordInput = document.getElementById('passwordInput');
+        const connectBtn = document.getElementById('connectBtn');
+        const status = document.getElementById('status');
+        const screenView = document.getElementById('screenView');
+        const sessionInfo = document.getElementById('sessionInfo');
+        const fpsCounter = document.getElementById('fpsCounter');
+        
+        // Keyboard tracking
+        const pressedKeys = new Set();
+        
+        function showStatus(message, type = 'info') {
+            status.textContent = message;
+            status.className = `status ${type}`;
+            status.style.display = 'block';
         }
         
-        function initiateSession() {
-            sessionPassword = passwordInput.value;
-            if (!sessionPassword) {
-                alert("Please enter a password.");
+        function hideStatus() {
+            status.style.display = 'none';
+        }
+        
+        function updateFPS() {
+            const now = Date.now();
+            if (now - lastFpsUpdate >= 1000) {
+                fpsCounter.textContent = `FPS: ${frameCount}`;
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+        }
+        
+        function connect() {
+            const password = passwordInput.value.trim();
+            if (!password) {
+                showStatus('Please enter a password', 'error');
                 return;
             }
-            startConnection();
+            
+            connectBtn.disabled = true;
+            showStatus('Connecting...', 'connecting');
+            
+            try {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws/connect`;
+                
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = function() {
+                    // Send handshake
+                    const handshake = {
+                        role: 'helper',
+                        password: password
+                    };
+                    ws.send(JSON.stringify(handshake));
+                };
+                
+                ws.onmessage = function(event) {
+                    try {
+                        if (event.data.startsWith('s:')) {
+                            // Screen data
+                            const base64Data = event.data.substring(2);
+                            screenView.src = `data:image/jpeg;base64,${base64Data}`;
+                            frameCount++;
+                            updateFPS();
+                            
+                            if (!connected) {
+                                connected = true;
+                                loginContainer.style.display = 'none';
+                                screenContainer.classList.add('active');
+                                sessionInfo.textContent = `Session: ${password.substring(0, 8)}...`;
+                                setupInputHandlers();
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Message handling error:', error);
+                    }
+                };
+                
+                ws.onclose = function(event) {
+                    connected = false;
+                    connectBtn.disabled = false;
+                    screenContainer.classList.remove('active');
+                    loginContainer.style.display = 'block';
+                    
+                    if (event.code === 1000) {
+                        showStatus('Disconnected', 'info');
+                    } else {
+                        showStatus('Connection lost. Please try again.', 'error');
+                    }
+                };
+                
+                ws.onerror = function(error) {
+                    console.error('WebSocket error:', error);
+                    showStatus('Connection error. Please try again.', 'error');
+                    connectBtn.disabled = false;
+                };
+                
+            } catch (error) {
+                console.error('Connection error:', error);
+                showStatus('Failed to connect. Please try again.', 'error');
+                connectBtn.disabled = false;
+            }
         }
-
-        connectBtn.addEventListener('click', initiateSession);
-        passwordInput.addEventListener('keyup', (e) => e.key === 'Enter' && initiateSession());
         
-        function sendControlMessage(data) { if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(data)); } }
-        screenView.addEventListener('mousemove', (e) => { const r = screenView.getBoundingClientRect(); sendControlMessage({ type: 'mouse_move', x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }); });
-        screenView.addEventListener('mousedown', (e) => { e.preventDefault(); const r = screenView.getBoundingClientRect(); sendControlMessage({ type: 'mouse_down', button: MOUSE_BUTTON_MAP[e.button], x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }); });
-        screenView.addEventListener('mouseup', (e) => { e.preventDefault(); const r = screenView.getBoundingClientRect(); sendControlMessage({ type: 'mouse_up', button: MOUSE_BUTTON_MAP[e.button], x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }); });
-        screenView.addEventListener('wheel', (e) => { e.preventDefault(); sendControlMessage({ type: 'mouse_scroll', dx: -e.deltaX, dy: -e.deltaY }); });
-        screenView.addEventListener('contextmenu', (e) => e.preventDefault());
-        document.addEventListener('keydown', (e) => { if (mainContainer.style.display === 'block') { e.preventDefault(); let k = KEY_MAP[e.key] || e.key; sendControlMessage({ type: 'key_down', key: k.length === 1 ? k.toLowerCase() : k }); } });
-        document.addEventListener('keyup', (e) => { if (mainContainer.style.display === 'block') { e.preventDefault(); let k = KEY_MAP[e.key] || e.key; sendControlMessage({ type: 'key_up', key: k.length === 1 ? k.toLowerCase() : k }); } });
+        function disconnect() {
+            if (ws) {
+                ws.close();
+            }
+        }
+        
+        function setupInputHandlers() {
+            // Mouse events
+            screenView.addEventListener('mousemove', function(e) {
+                if (!connected || !ws) return;
+                
+                const rect = screenView.getBoundingClientRect();
+                const x = (e.clientX - rect.left) / rect.width;
+                const y = (e.clientY - rect.top) / rect.height;
+                
+                const msg = {
+                    type: 'mousemove',
+                    x: Math.max(0, Math.min(1, x)),
+                    y: Math.max(0, Math.min(1, y))
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            screenView.addEventListener('mousedown', function(e) {
+                if (!connected || !ws) return;
+                e.preventDefault();
+                
+                const button = e.button === 0 ? 'left' : 'right';
+                const msg = {
+                    type: 'mousedown',
+                    button: button
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            screenView.addEventListener('mouseup', function(e) {
+                if (!connected || !ws) return;
+                e.preventDefault();
+                
+                const button = e.button === 0 ? 'left' : 'right';
+                const msg = {
+                    type: 'mouseup',
+                    button: button
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            screenView.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+            });
+            
+            screenView.addEventListener('wheel', function(e) {
+                if (!connected || !ws) return;
+                e.preventDefault();
+                
+                const msg = {
+                    type: 'scroll',
+                    delta: -e.deltaY / 100
+                };
+                
+                ws.send(JSON.stringify(msg));
+            });
+            
+            // Keyboard events
+            document.addEventListener('keydown', function(e) {
+                if (!connected || !ws) return;
+                
+                const key = e.key;
+                if (pressedKeys.has(key)) return; // Prevent key repeat
+                
+                pressedKeys.add(key);
+                
+                const msg = {
+                    type: 'keydown',
+                    key: key.length === 1 ? key : e.code.replace('Key', '').toLowerCase()
+                };
+                
+                ws.send(JSON.stringify(msg));
+                e.preventDefault();
+            });
+            
+            document.addEventListener('keyup', function(e) {
+                if (!connected || !ws) return;
+                
+                const key = e.key;
+                pressedKeys.delete(key);
+                
+                const msg = {
+                    type: 'keyup',
+                    key: key.length === 1 ? key : e.code.replace('Key', '').toLowerCase()
+                };
+                
+                ws.send(JSON.stringify(msg));
+                e.preventDefault();
+            });
+            
+            // Focus management
+            window.addEventListener('blur', function() {
+                pressedKeys.clear();
+            });
+        }
+        
+        // Enter key to connect
+        passwordInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                connect();
+            }
+        });
+        
+        // Auto-focus password input
+        passwordInput.focus();
     </script>
 </body>
 </html>
 """
 
-# --- Flask Routes ---
 @app.route('/')
 def index():
-    return Response(HELPER_INTERFACE_HTML, mimetype='text/html')
+    """Serve the helper interface"""
+    return HELPER_HTML
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint for Render.com"""
+    return jsonify({
+        'status': 'healthy',
+        'sessions': len(session_manager.sessions),
+        'timestamp': time.time()
+    })
 
 @sock.route('/ws/connect')
-def connect_websocket(ws):
-    ws_role, ws_pass = None, None
+def websocket_handler(ws):
+    """Main WebSocket endpoint for both clients and helpers"""
+    password = None
+    role = None
+    
     try:
+        # Wait for handshake message
         handshake_data = ws.receive(timeout=10)
-        if not handshake_data:
-            logging.warning("WebSocket handshake timeout.")
-            return
-
-        data = json.loads(handshake_data)
-        ws_role = data.get('role')
-        ws_pass = data.get('password')
-
-        if not all([ws_role, ws_pass]):
-            logging.error(f"Invalid handshake: {handshake_data}")
+        handshake = json.loads(handshake_data)
+        
+        password = handshake.get('password', '').strip()
+        role = handshake.get('role', '').strip()
+        
+        if not password or not role or role not in ['client', 'helper']:
+            ws.send(json.dumps({'error': 'Invalid handshake'}))
             return
         
-        logging.info(f"Handshake received: role={ws_role}, pass=***, from={ws.environ.get('REMOTE_ADDR')}")
-
-        if ws_pass not in sessions:
-            sessions[ws_pass] = {'client_ws': None, 'helper_ws': None}
-
-        # --- SELF-HEALING LOGIC ---
-        if ws_role == 'client':
-            if sessions[ws_pass]['client_ws'] is not None:
-                logging.warning(f"Replacing stale client for session '{ws_pass}'.")
-                try:
-                    sessions[ws_pass]['client_ws'].close(reason=1001, message="New client connected")
-                except Exception as e:
-                    logging.warning(f"Could not close stale client socket: {e}")
-            sessions[ws_pass]['client_ws'] = ws
+        # Add connection to session
+        session_manager.add_connection(password, role, ws)
         
-        elif ws_role == 'helper':
-            if sessions[ws_pass]['helper_ws'] is not None:
-                logging.warning(f"Replacing stale helper for session '{ws_pass}'.")
-                try:
-                    sessions[ws_pass]['helper_ws'].close(reason=1001, message="New helper connected")
-                except Exception as e:
-                    logging.warning(f"Could not close stale helper socket: {e}")
-            sessions[ws_pass]['helper_ws'] = ws
-        else:
-            logging.error(f"Unknown role '{ws_role}'")
-            return
-
+        logger.info(f"WebSocket connected: {role} for session {password[:8]}...")
+        
+        # Message forwarding loop
         while True:
-            message = ws.receive()
-            if message is None: break
-            session = sessions.get(ws_pass)
-            if not session: break
-            
-            if ws_role == 'client' and session.get('helper_ws'):
-                session['helper_ws'].send(message)
-            elif ws_role == 'helper' and session.get('client_ws'):
-                session['client_ws'].send(message)
-
+            try:
+                message = ws.receive(timeout=30)
+                
+                # Update activity
+                session_manager.update_activity(password)
+                
+                # Forward message to peer
+                peer_ws = session_manager.get_peer_ws(password, role)
+                if peer_ws and not peer_ws.closed:
+                    try:
+                        peer_ws.send(message)
+                    except Exception as e:
+                        logger.warning(f"Failed to forward message: {e}")
+                        break
+                
+            except Exception as e:
+                if "timeout" not in str(e).lower():
+                    logger.info(f"WebSocket receive error: {e}")
+                break
+                
     except Exception as e:
-        if "Connection closed" in str(e):
-            logging.info(f"WebSocket {ws_role} in session '{ws_pass}' disconnected: {e}")
-        else:
-            logging.error(f"Error in WebSocket handler for {ws_role} in session '{ws_pass}': {e}")
+        logger.error(f"WebSocket handler error: {e}")
     
     finally:
-        # ROBUST Cleanup
-        if ws_pass and ws_role and ws_pass in sessions:
-            if sessions[ws_pass].get(f'{ws_role}_ws') == ws:
-                sessions[ws_pass][f'{ws_role}_ws'] = None
-                logging.info(f"Cleaned up active {ws_role} for session '{ws_pass}'.")
-            if not sessions[ws_pass]['client_ws'] and not sessions[ws_pass]['helper_ws']:
-                logging.info(f"Session '{ws_pass}' is now empty and is being deleted.")
-                del sessions[ws_pass]
+        # Clean up connection
+        if password and role:
+            session_manager.remove_connection(password, role)
+            logger.info(f"WebSocket disconnected: {role} for session {password[:8]}...")
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
-    # This block is for local testing. Render uses the Procfile command.
-    from gevent.pywsgi import WSGIServer
-    from geventwebsocket.handler import WebSocketHandler
-    print("Starting development server on http://127.0.0.1:5000")
-    server = WSGIServer(('', 5000), app, handler_class=WebSocketHandler)
-    server.serve_forever()
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
