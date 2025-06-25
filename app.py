@@ -1,576 +1,316 @@
-#!/usr/bin/env python3
-"""
-Remote Desktop Broker Server
-Relays WebSocket messages between client and helper
-Compatible with Render.com deployment
-"""
-
-from flask import Flask, render_template_string
-from flask_sock import Sock
+import os
 import json
 import logging
-import os
+from flask import Flask, Response
+from flask_sock import Sock
+from gevent import pywsgi
+from geventwebsocket.handler import WebSocketHandler
 
+# --- Basic Configuration ---
+# Set up logging to see connection status in Render logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Flask App Initialization ---
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+# The secret key is needed for session management, but not strictly used here.
+# For production, it's good practice to set it from an environment variable.
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'a-very-secret-key-for-dev')
 sock = Sock(app)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Session management
+# --- Session Management ---
+# Global dictionary to hold session data.
+# Format: { 'password': {'client_ws': <WebSocket>, 'helper_ws': <WebSocket>} }
 sessions = {}
 
-# HTML/CSS/JS for helper interface
-HELPER_INTERFACE = """
+# --- Helper Interface (Controller UI) ---
+# All HTML, CSS, and JS are embedded in this single string.
+# This avoids needing to manage separate static files.
+HELPER_INTERFACE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Remote Desktop Helper</title>
+    <title>Remote Control Helper</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a1a;
-            color: #fff;
-            overflow: hidden;
-        }
-        
-        #login-container {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
-        }
-        
-        .login-box {
-            background: rgba(255, 255, 255, 0.1);
-            padding: 40px;
-            border-radius: 10px;
-            backdrop-filter: blur(10px);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-            text-align: center;
-            max-width: 400px;
-            width: 100%;
-        }
-        
-        .login-box h1 {
-            margin-bottom: 30px;
-            font-size: 28px;
-            font-weight: 300;
-        }
-        
-        .login-box input {
-            width: 100%;
-            padding: 12px 16px;
-            margin-bottom: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            background: rgba(255, 255, 255, 0.1);
-            color: #fff;
-            border-radius: 5px;
-            font-size: 16px;
-            transition: all 0.3s ease;
-        }
-        
-        .login-box input:focus {
-            outline: none;
-            border-color: #3498db;
-            background: rgba(255, 255, 255, 0.15);
-        }
-        
-        .login-box input::placeholder {
-            color: rgba(255, 255, 255, 0.6);
-        }
-        
-        .login-box button {
-            width: 100%;
-            padding: 12px 24px;
-            background: #3498db;
-            color: #fff;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .login-box button:hover {
-            background: #2980b9;
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(52, 152, 219, 0.4);
-        }
-        
-        .login-box button:disabled {
-            background: #7f8c8d;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        #screen-container {
-            display: none;
-            position: relative;
-            width: 100vw;
-            height: 100vh;
-            background: #000;
-        }
-        
-        #screen-view {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            cursor: crosshair;
-            user-select: none;
-            -webkit-user-select: none;
-            -moz-user-select: none;
-            -ms-user-select: none;
-        }
-        
-        #status-bar {
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            background: rgba(0, 0, 0, 0.8);
-            color: #fff;
-            padding: 10px 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 14px;
-            backdrop-filter: blur(10px);
-            z-index: 1000;
-        }
-        
-        .status-indicator {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            margin-right: 8px;
-            background: #e74c3c;
-        }
-        
-        .status-indicator.connected {
-            background: #2ecc71;
-        }
-        
-        .disconnect-btn {
-            padding: 6px 16px;
-            background: #e74c3c;
-            color: #fff;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            transition: all 0.3s ease;
-        }
-        
-        .disconnect-btn:hover {
-            background: #c0392b;
-        }
-        
-        #error-message {
-            display: none;
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: rgba(231, 76, 60, 0.9);
-            color: #fff;
-            padding: 20px 30px;
-            border-radius: 8px;
-            font-size: 16px;
-            z-index: 2000;
-            backdrop-filter: blur(10px);
-        }
-        
-        .loading-spinner {
-            display: none;
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            width: 50px;
-            height: 50px;
-            border: 3px solid rgba(255, 255, 255, 0.3);
-            border-top-color: #3498db;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            z-index: 1001;
-        }
-        
-        @keyframes spin {
-            to { transform: translate(-50%, -50%) rotate(360deg); }
-        }
+        body, html { margin: 0; padding: 0; height: 100%; overflow: hidden; background-color: #1a1a1a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        #auth-container { display: flex; align-items: center; justify-content: center; height: 100%; flex-direction: column; gap: 15px; }
+        #auth-container input { padding: 10px; width: 200px; background-color: #333; border: 1px solid #555; color: #fff; border-radius: 4px; }
+        #auth-container button { padding: 10px 20px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; font-weight: bold; }
+        #auth-container button:hover { background-color: #0056b3; }
+        #main-container { display: none; width: 100%; height: 100%; }
+        #screen-view { width: 100%; height: 100%; object-fit: contain; cursor: crosshair; }
+        #status-bar { position: fixed; top: 0; left: 0; background-color: rgba(0,0,0,0.7); padding: 5px 10px; font-size: 14px; border-bottom-right-radius: 5px; }
     </style>
 </head>
 <body>
-    <div id="login-container">
-        <div class="login-box">
-            <h1>Remote Desktop Helper</h1>
-            <input type="password" id="password-input" placeholder="Enter session password" autocomplete="off">
-            <button id="connect-btn" onclick="connect()">Connect</button>
-        </div>
+
+    <div id="auth-container">
+        <h2>Enter Session Password</h2>
+        <input type="password" id="password-input" placeholder="Password">
+        <button id="connect-btn">Connect</button>
     </div>
-    
-    <div id="screen-container">
-        <div id="status-bar">
-            <div>
-                <span class="status-indicator" id="status-indicator"></span>
-                <span id="status-text">Disconnected</span>
-                <span id="fps-counter" style="margin-left: 20px;"></span>
-            </div>
-            <button class="disconnect-btn" onclick="disconnect()">Disconnect</button>
-        </div>
-        <img id="screen-view" alt="Remote Screen">
-        <div class="loading-spinner" id="loading-spinner"></div>
-        <div id="error-message"></div>
+
+    <div id="main-container">
+        <div id="status-bar">Status: Disconnected</div>
+        <img id="screen-view" alt="Remote screen stream">
     </div>
-    
+
     <script>
-        let ws = null;
-        let isConnected = false;
-        let lastFrameTime = Date.now();
-        let frameCount = 0;
-        let fps = 0;
+        const passwordInput = document.getElementById('password-input');
+        const connectBtn = document.getElementById('connect-btn');
+        const authContainer = document.getElementById('auth-container');
+        const mainContainer = document.getElementById('main-container');
+        const screenView = document.getElementById('screen-view');
+        const statusBar = document.getElementById('status-bar');
+
+        let ws;
+
+        // Map JS event button numbers to strings
+        const MOUSE_BUTTON_MAP = { 0: 'left', 1: 'middle', 2: 'right' };
         
-        // Key mappings
-        const keyMap = {
-            'Enter': 'enter',
-            'Tab': 'tab',
-            ' ': 'space',
-            'Backspace': 'backspace',
-            'Delete': 'delete',
-            'Escape': 'escape',
-            'ArrowUp': 'up',
-            'ArrowDown': 'down',
-            'ArrowLeft': 'left',
-            'ArrowRight': 'right',
-            'Home': 'home',
-            'End': 'end',
-            'PageUp': 'page_up',
-            'PageDown': 'page_down',
-            'CapsLock': 'caps_lock',
-            'Shift': 'shift',
-            'Control': 'ctrl',
-            'Alt': 'alt',
-            'Meta': 'cmd',
-            'F1': 'f1',
-            'F2': 'f2',
-            'F3': 'f3',
-            'F4': 'f4',
-            'F5': 'f5',
-            'F6': 'f6',
-            'F7': 'f7',
-            'F8': 'f8',
-            'F9': 'f9',
-            'F10': 'f10',
-            'F11': 'f11',
-            'F12': 'f12'
+        // Map JS KeyboardEvent.key to pynput-compatible names for special keys
+        const KEY_MAP = {
+            "Control": "ctrl", "Shift": "shift", "Alt": "alt",
+            "Meta": "cmd", "ArrowUp": "up", "ArrowDown": "down",
+            "ArrowLeft": "left", "ArrowRight": "right", "Enter": "enter",
+            "Escape": "esc", "Backspace": "backspace", "Tab": "tab",
+            "Delete": "delete", "Insert": "insert", "Home": "home", "End": "end",
+            "PageUp": "page_up", "PageDown": "page_down",
+            "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4",
+            "F5": "f5", "F6": "f6", "F7": "f7", "F8": "f8",
+            "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
         };
-        
+
+
         function connect() {
-            const password = document.getElementById('password-input').value;
+            const password = passwordInput.value;
             if (!password) {
-                alert('Please enter a password');
+                alert("Please enter a password.");
                 return;
             }
-            
-            document.getElementById('connect-btn').disabled = true;
-            document.getElementById('connect-btn').textContent = 'Connecting...';
-            
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws/connect`;
+
+            // Determine WebSocket protocol based on page protocol
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${window.location.host}/ws/connect`;
             
             ws = new WebSocket(wsUrl);
-            
+
             ws.onopen = () => {
-                // Send handshake
+                console.log("WebSocket connection opened.");
+                statusBar.textContent = 'Status: Authenticating...';
+                // Send handshake message
                 ws.send(JSON.stringify({
                     role: 'helper',
                     password: password
                 }));
-                
-                isConnected = true;
-                document.getElementById('login-container').style.display = 'none';
-                document.getElementById('screen-container').style.display = 'block';
-                document.getElementById('status-indicator').classList.add('connected');
-                document.getElementById('status-text').textContent = 'Connected';
-                document.getElementById('loading-spinner').style.display = 'block';
-                
-                // Setup event listeners
-                setupEventListeners();
             };
-            
+
             ws.onmessage = (event) => {
-                const data = event.data;
-                
-                // Check if it's screen data
-                if (data.startsWith('s:')) {
-                    const base64Data = data.substring(2);
-                    const img = document.getElementById('screen-view');
-                    img.src = `data:image/jpeg;base64,${base64Data}`;
-                    
-                    // Hide loading spinner on first frame
-                    document.getElementById('loading-spinner').style.display = 'none';
-                    
-                    // Update FPS counter
-                    updateFPS();
+                // Screen data is sent as "s:<base64_string>"
+                if (event.data.startsWith('s:')) {
+                    if (authContainer.style.display !== 'none') {
+                        // First frame received, switch view
+                        authContainer.style.display = 'none';
+                        mainContainer.style.display = 'block';
+                        statusBar.textContent = 'Status: Connected';
+                    }
+                    const base64Data = event.data.substring(2);
+                    screenView.src = 'data:image/jpeg;base64,' + base64Data;
+                } else {
+                     // Handle other message types if needed in the future
+                    console.log("Received non-screen data:", event.data);
                 }
             };
-            
-            ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                showError('Connection error occurred');
-            };
-            
+
             ws.onclose = () => {
-                isConnected = false;
-                document.getElementById('status-indicator').classList.remove('connected');
-                document.getElementById('status-text').textContent = 'Disconnected';
-                showError('Connection closed');
-                setTimeout(() => {
-                    location.reload();
-                }, 2000);
+                console.log("WebSocket connection closed.");
+                statusBar.textContent = 'Status: Disconnected';
+                alert("Connection lost. Please reconnect.");
+                mainContainer.style.display = 'none';
+                authContainer.style.display = 'flex';
+                ws = null;
+            };
+
+            ws.onerror = (error) => {
+                console.error("WebSocket error:", error);
+                statusBar.textContent = 'Status: Error';
+                alert("Connection error occurred.");
             };
         }
-        
-        function disconnect() {
-            if (ws) {
-                ws.close();
-            }
-            location.reload();
-        }
-        
-        function setupEventListeners() {
-            const screen = document.getElementById('screen-view');
-            
-            // Mouse events
-            screen.addEventListener('mousemove', (e) => {
-                if (!isConnected) return;
-                
-                const rect = screen.getBoundingClientRect();
-                const x = (e.clientX - rect.left) / rect.width;
-                const y = (e.clientY - rect.top) / rect.height;
-                
-                sendCommand({
-                    type: 'mousemove',
-                    x: Math.max(0, Math.min(1, x)),
-                    y: Math.max(0, Math.min(1, y))
-                });
-            });
-            
-            screen.addEventListener('mousedown', (e) => {
-                if (!isConnected) return;
-                e.preventDefault();
-                
-                const button = e.button === 0 ? 'left' : e.button === 2 ? 'right' : 'middle';
-                sendCommand({
-                    type: 'mousedown',
-                    button: button
-                });
-            });
-            
-            screen.addEventListener('mouseup', (e) => {
-                if (!isConnected) return;
-                e.preventDefault();
-                
-                const button = e.button === 0 ? 'left' : e.button === 2 ? 'right' : 'middle';
-                sendCommand({
-                    type: 'mouseup',
-                    button: button
-                });
-            });
-            
-            screen.addEventListener('dblclick', (e) => {
-                if (!isConnected) return;
-                e.preventDefault();
-                
-                sendCommand({
-                    type: 'doubleclick',
-                    button: 'left'
-                });
-            });
-            
-            screen.addEventListener('wheel', (e) => {
-                if (!isConnected) return;
-                e.preventDefault();
-                
-                sendCommand({
-                    type: 'scroll',
-                    dx: e.deltaX / 100,
-                    dy: e.deltaY / 100
-                });
-            });
-            
-            // Disable context menu
-            screen.addEventListener('contextmenu', (e) => {
-                e.preventDefault();
-                return false;
-            });
-            
-            // Keyboard events
-            document.addEventListener('keydown', (e) => {
-                if (!isConnected) return;
-                
-                // Don't capture F5, F11, etc. for browser functionality
-                if (e.key === 'F5' || (e.key === 'F11' && !e.ctrlKey && !e.altKey)) {
-                    return;
-                }
-                
-                e.preventDefault();
-                
-                const key = keyMap[e.key] || e.key.toLowerCase();
-                sendCommand({
-                    type: 'keydown',
-                    key: key
-                });
-            });
-            
-            document.addEventListener('keyup', (e) => {
-                if (!isConnected) return;
-                
-                if (e.key === 'F5' || (e.key === 'F11' && !e.ctrlKey && !e.altKey)) {
-                    return;
-                }
-                
-                e.preventDefault();
-                
-                const key = keyMap[e.key] || e.key.toLowerCase();
-                sendCommand({
-                    type: 'keyup',
-                    key: key
-                });
-            });
-        }
-        
-        function sendCommand(command) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify(command));
-            }
-        }
-        
-        function showError(message) {
-            const errorEl = document.getElementById('error-message');
-            errorEl.textContent = message;
-            errorEl.style.display = 'block';
-            setTimeout(() => {
-                errorEl.style.display = 'none';
-            }, 5000);
-        }
-        
-        function updateFPS() {
-            frameCount++;
-            const now = Date.now();
-            const delta = now - lastFrameTime;
-            
-            if (delta >= 1000) {
-                fps = Math.round((frameCount * 1000) / delta);
-                document.getElementById('fps-counter').textContent = `${fps} FPS`;
-                frameCount = 0;
-                lastFrameTime = now;
-            }
-        }
-        
-        // Allow Enter key to connect
-        document.getElementById('password-input').addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
+
+        connectBtn.addEventListener('click', connect);
+        passwordInput.addEventListener('keyup', (event) => {
+            if (event.key === 'Enter') {
                 connect();
             }
         });
+
+
+        function sendControlMessage(data) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+            }
+        }
+
+        // --- Event Listeners for Remote Control ---
+
+        screenView.addEventListener('mousemove', (e) => {
+            const rect = screenView.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            const relX = x / rect.width;
+            const relY = y / rect.height;
+            sendControlMessage({ type: 'mouse_move', x: relX, y: relY });
+        });
+
+        screenView.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            const rect = screenView.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            const relX = x / rect.width;
+            const relY = y / rect.height;
+            sendControlMessage({ type: 'mouse_down', x: relX, y: relY, button: MOUSE_BUTTON_MAP[e.button] });
+        });
+
+        screenView.addEventListener('mouseup', (e) => {
+            e.preventDefault();
+            const rect = screenView.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            const relX = x / rect.width;
+            const relY = y / rect.height;
+            sendControlMessage({ type: 'mouse_up', x: relX, y: relY, button: MOUSE_BUTTON_MAP[e.button] });
+        });
+        
+        screenView.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            sendControlMessage({ type: 'mouse_scroll', dx: -e.deltaX, dy: -e.deltaY });
+        });
+
+        screenView.addEventListener('contextmenu', (e) => {
+            e.preventDefault(); // Prevent browser right-click menu
+        });
+
+        // Add keyboard event listeners to the whole document
+        document.addEventListener('keydown', (e) => {
+            if (mainContainer.style.display === 'block') {
+                e.preventDefault();
+                let key = KEY_MAP[e.key] || e.key;
+                if(key.length === 1) key = key.toLowerCase(); // send lowercase for char keys
+                sendControlMessage({ type: 'key_down', key: key });
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (mainContainer.style.display === 'block') {
+                e.preventDefault();
+                let key = KEY_MAP[e.key] || e.key;
+                if(key.length === 1) key = key.toLowerCase();
+                sendControlMessage({ type: 'key_up', key: key });
+            }
+        });
+
     </script>
 </body>
 </html>
 """
 
+# --- Flask Routes ---
 @app.route('/')
 def index():
-    """Serve the helper interface"""
-    return render_template_string(HELPER_INTERFACE)
+    """Serves the helper's web interface."""
+    return Response(HELPER_INTERFACE_HTML, mimetype='text/html')
 
 @sock.route('/ws/connect')
-def websocket_handler(ws):
-    """Handle WebSocket connections"""
-    role = None
-    password = None
+def connect_websocket(ws):
+    """Handles WebSocket connections for both clients and helpers."""
+    ws_role = None
+    ws_pass = None
     
     try:
-        # Wait for handshake message
-        handshake_data = ws.receive()
-        handshake = json.loads(handshake_data)
-        
-        role = handshake.get('role')
-        password = handshake.get('password')
-        
-        if not role or not password:
-            ws.send(json.dumps({'error': 'Invalid handshake'}))
+        # Step 1: Handshake
+        # The first message must be a JSON object identifying the role and password.
+        handshake_data = ws.receive(timeout=10) # 10 second timeout for handshake
+        if not handshake_data:
+            logging.warning("WebSocket handshake timeout.")
+            return
+
+        data = json.loads(handshake_data)
+        ws_role = data.get('role')
+        ws_pass = data.get('password')
+
+        if not all([ws_role, ws_pass]):
+            logging.error(f"Invalid handshake from {ws.environ.get('REMOTE_ADDR')}: {handshake_data}")
             return
         
-        logger.info(f"New {role} connection for session: {password}")
-        
-        # Initialize session if doesn't exist
-        if password not in sessions:
-            sessions[password] = {'client_ws': None, 'helper_ws': None}
-        
-        # Store WebSocket reference
-        if role == 'client':
-            sessions[password]['client_ws'] = ws
-        elif role == 'helper':
-            sessions[password]['helper_ws'] = ws
+        logging.info(f"Handshake received: role={ws_role}, pass=***, from={ws.environ.get('REMOTE_ADDR')}")
+
+        # Step 2: Session Association
+        # Create session if it doesn't exist
+        if ws_pass not in sessions:
+            sessions[ws_pass] = {'client_ws': None, 'helper_ws': None}
+
+        # Check for role conflict and assign WebSocket to the session
+        if ws_role == 'client':
+            if sessions[ws_pass]['client_ws'] is not None:
+                logging.warning(f"Client already connected for session '{ws_pass}'. Closing new connection.")
+                ws.close(reason=1008, message="Client already connected.")
+                return
+            sessions[ws_pass]['client_ws'] = ws
+        elif ws_role == 'helper':
+            if sessions[ws_pass]['helper_ws'] is not None:
+                logging.warning(f"Helper already connected for session '{ws_pass}'. Closing new connection.")
+                ws.close(reason=1008, message="Helper already connected.")
+                return
+            sessions[ws_pass]['helper_ws'] = ws
         else:
-            ws.send(json.dumps({'error': 'Invalid role'}))
+            logging.error(f"Unknown role '{ws_role}'")
             return
-        
-        # Message relay loop
+
+        # Step 3: Message Relaying
+        # This is the main loop that forwards messages.
         while True:
             message = ws.receive()
-            if message is None:
+            if message is None: # Connection closed
                 break
-            
-            # Relay message to the other party
-            if role == 'client' and sessions[password]['helper_ws']:
-                try:
-                    sessions[password]['helper_ws'].send(message)
-                except Exception as e:
-                    logger.error(f"Error relaying to helper: {e}")
-                    
-            elif role == 'helper' and sessions[password]['client_ws']:
-                try:
-                    sessions[password]['client_ws'].send(message)
-                except Exception as e:
-                    logger.error(f"Error relaying to client: {e}")
-    
-    except json.JSONDecodeError:
-        logger.error("Invalid JSON in handshake")
+
+            session = sessions.get(ws_pass)
+            if not session:
+                break # Session was probably cleaned up
+
+            # Relay logic:
+            if ws_role == 'client' and session.get('helper_ws'):
+                session['helper_ws'].send(message)
+            elif ws_role == 'helper' and session.get('client_ws'):
+                session['client_ws'].send(message)
+
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logging.error(f"Error in WebSocket handler for {ws_role} in session '{ws_pass}': {e}", exc_info=False)
+    
     finally:
-        # Clean up on disconnect
-        if password and password in sessions:
-            if role == 'client':
-                sessions[password]['client_ws'] = None
-            elif role == 'helper':
-                sessions[password]['helper_ws'] = None
+        # Step 4: Cleanup
+        # This block executes when the connection is closed or an error occurs.
+        if ws_pass and ws_role and ws_pass in sessions:
+            logging.info(f"Cleaning up {ws_role} for session '{ws_pass}'.")
             
-            # Remove empty sessions
-            if sessions[password]['client_ws'] is None and sessions[password]['helper_ws'] is None:
-                del sessions[password]
-        
-        logger.info(f"{role} disconnected from session: {password}")
+            # Remove the specific websocket from the session
+            if sessions[ws_pass].get(f'{ws_role}_ws') == ws:
+                sessions[ws_pass][f'{ws_role}_ws'] = None
+            
+            # If both participants are gone, delete the whole session
+            if not sessions[ws_pass]['client_ws'] and not sessions[ws_pass]['helper_ws']:
+                logging.info(f"Session '{ws_pass}' is now empty and is being deleted.")
+                del sessions[ws_pass]
+
+        if not ws.closed:
+             ws.close()
 
 if __name__ == '__main__':
-    # Development server
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # This is for local development testing.
+    # On Render, gunicorn will run the app.
+    print("Starting server on http://127.0.0.1:5000")
+    # Using gevent-pywsgi with WebSocketHandler for proper local testing
+    server = pywsgi.WSGIServer(('', 5000), app, handler_class=WebSocketHandler)
+    server.serve_forever()
