@@ -231,18 +231,28 @@ def connect_websocket(ws):
         if ws_pass not in sessions:
             sessions[ws_pass] = {'client_ws': None, 'helper_ws': None}
 
+        # --- MODIFIED SELF-HEALING LOGIC ---
         if ws_role == 'client':
+            # If a client already exists, assume it's stale. Close it and replace it.
             if sessions[ws_pass]['client_ws'] is not None:
-                logging.warning(f"Client already connected for session '{ws_pass}'. Closing new connection.")
-                ws.close(reason=1008, message="Client already connected.")
-                return
-            sessions[ws_pass]['client_ws'] = ws
+                logging.warning(f"Replacing stale client for session '{ws_pass}'.")
+                try:
+                    # Politely close the old connection
+                    sessions[ws_pass]['client_ws'].close(reason=1001, message="New client connected")
+                except Exception as e:
+                    logging.warning(f"Could not close stale client socket: {e}")
+            sessions[ws_pass]['client_ws'] = ws # Assign the new connection
+        
         elif ws_role == 'helper':
+            # If a helper already exists, assume it's stale. Close it and replace it.
             if sessions[ws_pass]['helper_ws'] is not None:
-                logging.warning(f"Helper already connected for session '{ws_pass}'. Closing new connection.")
-                ws.close(reason=1008, message="Helper already connected.")
-                return
-            sessions[ws_pass]['helper_ws'] = ws
+                logging.warning(f"Replacing stale helper for session '{ws_pass}'.")
+                try:
+                    # Politely close the old connection
+                    sessions[ws_pass]['helper_ws'].close(reason=1001, message="New helper connected")
+                except Exception as e:
+                    logging.warning(f"Could not close stale helper socket: {e}")
+            sessions[ws_pass]['helper_ws'] = ws # Assign the new connection
         else:
             logging.error(f"Unknown role '{ws_role}'")
             return
@@ -262,25 +272,30 @@ def connect_websocket(ws):
                 session['client_ws'].send(message)
 
     except Exception as e:
-        logging.error(f"Error in WebSocket handler for {ws_role} in session '{ws_pass}': {e}", exc_info=False)
+        # The 'Connection closed' message is normal when a client/helper disconnects.
+        # We can log it as info instead of an error to reduce noise in logs.
+        if "Connection closed" in str(e):
+            logging.info(f"WebSocket {ws_role} in session '{ws_pass}' disconnected: {e}")
+        else:
+            logging.error(f"Error in WebSocket handler for {ws_role} in session '{ws_pass}': {e}")
     
     finally:
-        # Step 4: ROBUST Cleanup
+        # ROBUST Cleanup
         if ws_pass and ws_role and ws_pass in sessions:
-            logging.info(f"Cleaning up {ws_role} for session '{ws_pass}'.")
-            
+            # Only remove the ws if it's the current one for this session
             if sessions[ws_pass].get(f'{ws_role}_ws') == ws:
                 sessions[ws_pass][f'{ws_role}_ws'] = None
+                logging.info(f"Cleaned up active {ws_role} for session '{ws_pass}'.")
             
+            # If both participants are gone, delete the whole session
             if not sessions[ws_pass]['client_ws'] and not sessions[ws_pass]['helper_ws']:
                 logging.info(f"Session '{ws_pass}' is now empty and is being deleted.")
                 del sessions[ws_pass]
-        # The line 'if not ws.closed: ws.close()' has been REMOVED.
-        # flask-sock will handle the socket closure when this function returns.
-        # This prevents the AttributeError crash.
-
 
 if __name__ == '__main__':
     print("Starting server on http://127.0.0.1:5000")
-    server = pywsgi.WSGIServer(('', 5000), app, handler_class=WebSocketHandler)
+    # For local testing, gevent-websocket is still useful, but the app code shouldn't depend on it
+    from gevent.pywsgi import WSGIServer
+    from geventwebsocket.handler import WebSocketHandler
+    server = WSGIServer(('', 5000), app, handler_class=WebSocketHandler)
     server.serve_forever()
