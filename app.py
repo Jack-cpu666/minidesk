@@ -7,24 +7,17 @@ from gevent import pywsgi
 from geventwebsocket.handler import WebSocketHandler
 
 # --- Basic Configuration ---
-# Set up logging to see connection status in Render logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
-# The secret key is needed for session management, but not strictly used here.
-# For production, it's good practice to set it from an environment variable.
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'a-very-secret-key-for-dev')
 sock = Sock(app)
 
 # --- Session Management ---
-# Global dictionary to hold session data.
-# Format: { 'password': {'client_ws': <WebSocket>, 'helper_ws': <WebSocket>} }
 sessions = {}
 
 # --- Helper Interface (Controller UI) ---
-# All HTML, CSS, and JS are embedded in this single string.
-# This avoids needing to manage separate static files.
 HELPER_INTERFACE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -66,10 +59,8 @@ HELPER_INTERFACE_HTML = """
 
         let ws;
 
-        // Map JS event button numbers to strings
         const MOUSE_BUTTON_MAP = { 0: 'left', 1: 'middle', 2: 'right' };
         
-        // Map JS KeyboardEvent.key to pynput-compatible names for special keys
         const KEY_MAP = {
             "Control": "ctrl", "Shift": "shift", "Alt": "alt",
             "Meta": "cmd", "ArrowUp": "up", "ArrowDown": "down",
@@ -90,7 +81,6 @@ HELPER_INTERFACE_HTML = """
                 return;
             }
 
-            // Determine WebSocket protocol based on page protocol
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${wsProtocol}//${window.location.host}/ws/connect`;
             
@@ -99,7 +89,6 @@ HELPER_INTERFACE_HTML = """
             ws.onopen = () => {
                 console.log("WebSocket connection opened.");
                 statusBar.textContent = 'Status: Authenticating...';
-                // Send handshake message
                 ws.send(JSON.stringify({
                     role: 'helper',
                     password: password
@@ -107,10 +96,8 @@ HELPER_INTERFACE_HTML = """
             };
 
             ws.onmessage = (event) => {
-                // Screen data is sent as "s:<base64_string>"
                 if (event.data.startsWith('s:')) {
                     if (authContainer.style.display !== 'none') {
-                        // First frame received, switch view
                         authContainer.style.display = 'none';
                         mainContainer.style.display = 'block';
                         statusBar.textContent = 'Status: Connected';
@@ -118,7 +105,6 @@ HELPER_INTERFACE_HTML = """
                     const base64Data = event.data.substring(2);
                     screenView.src = 'data:image/jpeg;base64,' + base64Data;
                 } else {
-                     // Handle other message types if needed in the future
                     console.log("Received non-screen data:", event.data);
                 }
             };
@@ -152,8 +138,6 @@ HELPER_INTERFACE_HTML = """
                 ws.send(JSON.stringify(data));
             }
         }
-
-        // --- Event Listeners for Remote Control ---
 
         screenView.addEventListener('mousemove', (e) => {
             const rect = screenView.getBoundingClientRect();
@@ -190,15 +174,14 @@ HELPER_INTERFACE_HTML = """
         });
 
         screenView.addEventListener('contextmenu', (e) => {
-            e.preventDefault(); // Prevent browser right-click menu
+            e.preventDefault();
         });
 
-        // Add keyboard event listeners to the whole document
         document.addEventListener('keydown', (e) => {
             if (mainContainer.style.display === 'block') {
                 e.preventDefault();
                 let key = KEY_MAP[e.key] || e.key;
-                if(key.length === 1) key = key.toLowerCase(); // send lowercase for char keys
+                if(key.length === 1) key = key.toLowerCase();
                 sendControlMessage({ type: 'key_down', key: key });
             }
         });
@@ -230,9 +213,7 @@ def connect_websocket(ws):
     ws_pass = None
     
     try:
-        # Step 1: Handshake
-        # The first message must be a JSON object identifying the role and password.
-        handshake_data = ws.receive(timeout=10) # 10 second timeout for handshake
+        handshake_data = ws.receive(timeout=10)
         if not handshake_data:
             logging.warning("WebSocket handshake timeout.")
             return
@@ -247,12 +228,9 @@ def connect_websocket(ws):
         
         logging.info(f"Handshake received: role={ws_role}, pass=***, from={ws.environ.get('REMOTE_ADDR')}")
 
-        # Step 2: Session Association
-        # Create session if it doesn't exist
         if ws_pass not in sessions:
             sessions[ws_pass] = {'client_ws': None, 'helper_ws': None}
 
-        # Check for role conflict and assign WebSocket to the session
         if ws_role == 'client':
             if sessions[ws_pass]['client_ws'] is not None:
                 logging.warning(f"Client already connected for session '{ws_pass}'. Closing new connection.")
@@ -269,18 +247,15 @@ def connect_websocket(ws):
             logging.error(f"Unknown role '{ws_role}'")
             return
 
-        # Step 3: Message Relaying
-        # This is the main loop that forwards messages.
         while True:
             message = ws.receive()
-            if message is None: # Connection closed
+            if message is None:
                 break
 
             session = sessions.get(ws_pass)
             if not session:
-                break # Session was probably cleaned up
+                break
 
-            # Relay logic:
             if ws_role == 'client' and session.get('helper_ws'):
                 session['helper_ws'].send(message)
             elif ws_role == 'helper' and session.get('client_ws'):
@@ -290,27 +265,22 @@ def connect_websocket(ws):
         logging.error(f"Error in WebSocket handler for {ws_role} in session '{ws_pass}': {e}", exc_info=False)
     
     finally:
-        # Step 4: Cleanup
-        # This block executes when the connection is closed or an error occurs.
+        # Step 4: ROBUST Cleanup
         if ws_pass and ws_role and ws_pass in sessions:
             logging.info(f"Cleaning up {ws_role} for session '{ws_pass}'.")
             
-            # Remove the specific websocket from the session
             if sessions[ws_pass].get(f'{ws_role}_ws') == ws:
                 sessions[ws_pass][f'{ws_role}_ws'] = None
             
-            # If both participants are gone, delete the whole session
             if not sessions[ws_pass]['client_ws'] and not sessions[ws_pass]['helper_ws']:
                 logging.info(f"Session '{ws_pass}' is now empty and is being deleted.")
                 del sessions[ws_pass]
+        # The line 'if not ws.closed: ws.close()' has been REMOVED.
+        # flask-sock will handle the socket closure when this function returns.
+        # This prevents the AttributeError crash.
 
-        if not ws.closed:
-             ws.close()
 
 if __name__ == '__main__':
-    # This is for local development testing.
-    # On Render, gunicorn will run the app.
     print("Starting server on http://127.0.0.1:5000")
-    # Using gevent-pywsgi with WebSocketHandler for proper local testing
     server = pywsgi.WSGIServer(('', 5000), app, handler_class=WebSocketHandler)
     server.serve_forever()
